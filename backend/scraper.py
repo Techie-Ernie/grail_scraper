@@ -64,27 +64,28 @@ class HolyGrailScraper:
     def download_documents(self, documents, download_dir='/home/ernie/grail_scraper/documents/econs'):
         os.makedirs(download_dir, exist_ok=True)
         for link, document_name in documents.items():
-            document_name = document_name + ".pdf"
-            subprocess.run(
-                ["wget", link, "-O", document_name],
-                cwd=download_dir,
-                check=False
-            )
-            pdf = pymupdf.open(f"{download_dir}/{document_name}")
-            ans = ['markscheme', 'answerkey', 'answersheet', "suggestedanswers"]
             ans_dir = f"{download_dir}/answer_keys"
             question_dir = f"{download_dir}/question_papers"
-            print(pdf[0].get_text().strip().replace(' ', ''))
-            if any(word in pdf[0].get_text().strip().replace(' ', '').lower() for word in ans) or any(word in document_name.strip().replace(' ', '').lower() for word in ans):
-                # check if file is answer key using the file name or first page of pdf 
-                # maybe can remove first page check? but it barely adds any latency
-                os.makedirs(ans_dir, exist_ok=True)
-                shutil.move(f"{download_dir}/{document_name}", f"{ans_dir}/{document_name}")
+            document_name = document_name + ".pdf"
+            if not os.path.exists(f"{ans_dir}/{document_name}") and not os.path.exists(f"{question_dir}/{document_name}"):
+                subprocess.run(
+                    ["wget", link, "-O", document_name],
+                    cwd=download_dir,
+                    check=False
+                )
+                pdf = pymupdf.open(f"{download_dir}/{document_name}")
+                ans = ['markscheme', 'answerkey', 'answersheet', "suggestedanswers"]
+                if any(word in pdf[0].get_text().strip().replace(' ', '').lower() for word in ans) or any(word in document_name.strip().replace(' ', '').lower() for word in ans):
+                    # check if file is answer key using the file name or first page of pdf 
+                    # maybe can remove first page check? but it barely adds any latency
+                    os.makedirs(ans_dir, exist_ok=True)
+                    shutil.move(f"{download_dir}/{document_name}", f"{ans_dir}/{document_name}")
+                else:
+                    print('question paper')
+                    os.makedirs(question_dir, exist_ok=True)
+                    shutil.move(f"{download_dir}/{document_name}", f"{question_dir}/{document_name}")
             else:
-                print('question paper')
-                os.makedirs(question_dir, exist_ok=True)
-                shutil.move(f"{download_dir}/{document_name}", f"{question_dir}/{document_name}")
-
+                print(f"Document {document_name} already downloaded")
         
             
 
