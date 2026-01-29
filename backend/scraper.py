@@ -12,6 +12,13 @@ class HolyGrailScraper:
         self.documentType = documentType
         self.year = year
         self.pages = pages
+        self.documents = []
+        self.current_document_name = None
+        self.current_source_link = None
+
+    def set_current_document(self, source_link, document_name):
+        self.current_source_link = source_link
+        self.current_document_name = document_name
     async def get_documents(self):
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=False)
@@ -47,6 +54,10 @@ class HolyGrailScraper:
                     href = await link.get_attribute("href")
                     document_name = await link.inner_text()
                     documents[href] = document_name
+                    self.documents.append({
+                        "source_link": href,
+                        "document_name": document_name,
+                    })
         
                 if i == self.pages:
                     break
@@ -64,6 +75,7 @@ class HolyGrailScraper:
     def download_documents(self, documents, download_dir='/home/ernie/grail_scraper/documents/econs'):
         os.makedirs(download_dir, exist_ok=True)
         for link, document_name in documents.items():
+            self.set_current_document(link, document_name)
             ans_dir = f"{download_dir}/answer_keys"
             question_dir = f"{download_dir}/question_papers"
             document_name = document_name + ".pdf"
@@ -74,7 +86,7 @@ class HolyGrailScraper:
                     check=False
                 )
                 pdf = pymupdf.open(f"{download_dir}/{document_name}")
-                ans = ['markscheme', 'answerkey', 'answersheet', "suggestedanswers"]
+                ans = ['markscheme', 'answerkey', 'answersheet', "suggestedanswers", "examinersreportf"]
                 if any(word in pdf[0].get_text().strip().replace(' ', '').lower() for word in ans) or any(word in document_name.strip().replace(' ', '').lower() for word in ans):
                     # check if file is answer key using the file name or first page of pdf 
                     # maybe can remove first page check? but it barely adds any latency
@@ -87,10 +99,24 @@ class HolyGrailScraper:
             else:
                 print(f"Document {document_name} already downloaded")
         
-            
+    def get_scraper_context(self):
+        source_link = self.current_source_link
+        document_name = self.current_document_name
+        if not source_link or not document_name:
+            if self.documents:
+                source_link = self.documents[0].get("source_link")
+                document_name = self.documents[0].get("document_name")
+        return {
+            'year': self.year,
+            'subject': self.subject,
+            'category': self.category,
+            'question_type': 'exam',
+            'source_link': source_link,
+            'document_name': document_name
+        }
 
 if __name__ == "__main__":
-    scraper = HolyGrailScraper("GCE 'A' Levels", "H2 Economics", None, "Exam Papers")
+    scraper = HolyGrailScraper("GCE 'A' Levels", "H2 Economics", None, "Exam Papers", pages=3)
     docs = asyncio.run(scraper.get_documents())
     #print(docs)
     scraper.download_documents(docs)
