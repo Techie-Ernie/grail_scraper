@@ -13,6 +13,7 @@ const fallbackYears = Array.from({ length: 10 }, (_, index) => {
   return year;
 });
 
+
 const basePrompt = `
 You are an information extraction engine. You MUST NOT generate any content that is not present verbatim in the input.
 
@@ -244,7 +245,7 @@ export default function App() {
         overrides.year ??
         (year === "All" ? null : Number.isNaN(Number(year)) ? null : Number(year)),
       document_type: "Exam Papers",
-      pages: 3,
+      pages: 2,
       subject_label: subjectLabel,
     };
     await fetch(`${API_URL}/scraper/config`, {
@@ -383,50 +384,66 @@ export default function App() {
         throw new Error(detail || "Could not load document text.");
       }
       const dataPayload = await dataRes.json();
-      const contextPayload = dataPayload.context;
-      if (contextPayload?.document_name) {
-        setDocumentName(contextPayload.document_name);
-      }
-      if (contextPayload?.subject && subject === "All") {
-        setSubject(contextPayload.subject);
-      }
-      if (contextPayload?.category && category === "All") {
-        setCategory(contextPayload.category);
-      }
-      if (typeof contextPayload?.year === "number" && year === "All") {
-        setYear(contextPayload.year > 0 ? String(contextPayload.year) : "All");
-      }
-      if (contextPayload) {
-        await syncContext(contextPayload);
-      }
-      const subjectForPrompt = subject === "All" ? "" : subject;
-      const subtopicRes = subjectForPrompt
-        ? await fetch(`${API_URL}/subtopics?${buildQuery({ subject: subjectForPrompt })}`)
-        : null;
-      const subtopicData = subtopicRes ? await subtopicRes.json() : { subtopics: [] };
-      const subtopicLines = (subtopicData.subtopics || [])
-        .map((item) => `${item.code} ${item.title}`)
-        .join("\n");
+      const documentPayloads = Array.isArray(dataPayload.documents) && dataPayload.documents.length > 0
+        ? dataPayload.documents
+        : [{ text: dataPayload.text, context: dataPayload.context }];
 
-      const { text } = dataPayload;
-      const prompt = `${basePrompt}\nSUBTOPICS (use exact match):\n${subtopicLines}\n\n${text}`;
+      for (let index = 0; index < documentPayloads.length; index += 1) {
+        const { text, context } = documentPayloads[index] || {};
+        const contextPayload = context;
 
-      const aiResponse = await window.puter.ai.chat(prompt, { model: MODEL });
-      const output =
-        typeof aiResponse === "string"
-          ? aiResponse
-          : aiResponse?.message?.content || aiResponse?.content || JSON.stringify(aiResponse);
+        if (contextPayload?.document_name) {
+          setDocumentName(contextPayload.document_name);
+        }
+        if (contextPayload?.subject && subject === "All") {
+          setSubject(contextPayload.subject);
+        }
+        if (contextPayload?.category && category === "All") {
+          setCategory(contextPayload.category);
+        }
+        if (typeof contextPayload?.year === "number" && year === "All") {
+          setYear(contextPayload.year > 0 ? String(contextPayload.year) : "All");
+        }
+        if (contextPayload) {
+          await syncContext(contextPayload);
+        }
 
-      const resultObj = parseAiJson(output);
+        const subjectForPrompt = contextPayload?.subject || (subject === "All" ? "" : subject);
+        const subtopicRes = subjectForPrompt
+          ? await fetch(`${API_URL}/subtopics?${buildQuery({ subject: subjectForPrompt })}`)
+          : null;
+        const subtopicData = subtopicRes ? await subtopicRes.json() : { subtopics: [] };
+        const subtopicLines = (subtopicData.subtopics || [])
+          .map((item) => `${item.code} ${item.title}`)
+          .join("\n");
 
-      const postRes = await fetch(`${API_URL}/ai-result`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ result: resultObj, context: contextPayload }),
+        const prompt = `${basePrompt}\nSUBTOPICS (use exact match):\n${subtopicLines}\n\n${text}`;
+
+        setStatus({
+          type: "idle",
+          message: `Running AI extraction ${index + 1} of ${documentPayloads.length}...`,
+        });
+
+        const aiResponse = await window.puter.ai.chat(prompt, { model: MODEL });
+        const output =
+          typeof aiResponse === "string"
+            ? aiResponse
+            : aiResponse?.message?.content || aiResponse?.content || JSON.stringify(aiResponse);
+
+        const resultObj = parseAiJson(output);
+
+        const postRes = await fetch(`${API_URL}/ai-result`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ result: resultObj, context: contextPayload }),
+        });
+        await postRes.json();
+      }
+
+      setStatus({
+        type: "success",
+        message: `AI pipeline complete: processed ${documentPayloads.length} document(s).`,
       });
-      const postData = await postRes.json();
-
-      setStatus({ type: "success", message: `AI pipeline complete: ${postData.status || "ok"}` });
       await loadQuestions();
     } catch (err) {
       setStatus({ type: "error", message: err.message || "Pipeline failed." });
@@ -451,12 +468,10 @@ export default function App() {
         <div className="grid gap-6 lg:grid-cols-[280px_minmax(0,1fr)]">
           <aside className="order-2 flex flex-col gap-6 rounded-2xl border border-slate-200 bg-slate-100/80 p-5 shadow-sm lg:order-1 lg:sticky lg:top-6 lg:h-[calc(100vh-3rem)]">
             <div className="flex items-center gap-4">
-              <div className="flex h-12 w-12 items-center justify-center rounded-2xl bg-amber-500 text-lg font-semibold text-white">
-                G
-              </div>
+              
               <div>
-                <h1 className="text-lg font-semibold text-slate-900">Grail Questions</h1>
-                <p className="text-sm text-slate-600">Filter by syllabus chapter and year.</p>
+                <h1 className="text-2xl font-semibold text-slate-900">Graili</h1>
+                <p className="text-sm text-slate-600">(Holy) Grail Improved</p>
               </div>
             </div>
 
@@ -528,9 +543,6 @@ export default function App() {
             <section className="flex flex-col gap-4 rounded-2xl border border-slate-200 bg-white/80 p-6 shadow-sm backdrop-blur">
               <div className="flex flex-col gap-3 lg:flex-row lg:items-start lg:justify-between">
                 <div>
-                  <p className="text-xs font-semibold uppercase tracking-wide text-amber-600">
-                    Curate the question bank
-                  </p>
                   <h2 className="mt-2 text-3xl font-semibold text-slate-900">
                     Curate the question bank
                   </h2>
@@ -555,14 +567,13 @@ export default function App() {
             <section className="rounded-2xl border border-slate-200 bg-white/80 p-6 shadow-sm">
               <div>
                 <h3 className="text-lg font-semibold text-slate-900">
-                  Seed subtopics from syllabus
+                  Seed chapters from syllabus
                 </h3>
                 <p className="mt-2 text-sm text-slate-600">
-                  Upload the syllabus PDF for the selected subject and let Gemini extract the
-                  subtopic list.
+                  Upload the syllabus PDF for the selected subject to extract the subtopics.
                 </p>
               </div>
-              <div className="mt-4 flex flex-col gap-3 lg:flex-row lg:items-center">
+              <div className="mt-4 flex flex-col gap-3 lg:flex-row lg:items-end">
                 <div className="flex-1 space-y-2">
                   <label htmlFor="syllabus-file" className="text-sm font-medium text-slate-700">
                     Syllabus PDF
@@ -572,11 +583,11 @@ export default function App() {
                     type="file"
                     accept="application/pdf"
                     onChange={(event) => setSyllabusFile(event.target.files?.[0] || null)}
-                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm file:mr-4 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-1 file:text-sm file:font-semibold file:text-slate-700 hover:file:bg-slate-200 focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-amber-200"
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-700 shadow-sm file:mr-4 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-1.5 file:text-sm file:font-semibold file:text-slate-700 hover:file:bg-slate-200 focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-amber-200"
                   />
                 </div>
                 <button
-                  className={primaryButton}
+                  className={`${primaryButton} h-11`}
                   onClick={extractSubtopicsFromSyllabus}
                   disabled={isLoading}
                 >
@@ -647,6 +658,7 @@ export default function App() {
             </section>
 
             <section className="flex flex-wrap gap-3">
+              {/*
               <button
                 type="button"
                 className={secondaryButton}
@@ -655,6 +667,7 @@ export default function App() {
               >
                 Sync context
               </button>
+              */}
               <button
                 type="button"
                 className={primaryButton}
@@ -669,7 +682,7 @@ export default function App() {
                 onClick={runAiPipeline}
                 disabled={isLoading}
               >
-                Run AI extraction
+                Extract
               </button>
             </section>
 
@@ -686,8 +699,9 @@ export default function App() {
                     key={question.id}
                     className="grid gap-4 rounded-2xl border border-slate-200 bg-white p-5 shadow-sm lg:grid-cols-[140px_minmax(0,1fr)_90px]"
                   >
+                    
                     <div className="space-y-2 text-xs uppercase tracking-wide text-slate-500">
-                      <span className="block">{question.year}</span>
+                      <span className="block">Year: {question.year}</span>
                       <span className="block">{question.category}</span>
                       <span className="block">{question.question_type}</span>
                     </div>
@@ -700,11 +714,18 @@ export default function App() {
                         <span className="rounded-full bg-slate-100 px-2 py-1">
                           {question.subject}
                         </span>
-                        <span className="rounded-full bg-slate-100 px-2 py-1">
-                          {question.source_link || "Source pending"}
-                        </span>
+                          {question.mark_scheme && (
+                            <a
+                              className="rounded-full bg-red-100 px-2 py-1"
+                              href={question.mark_scheme}
+                            >
+                              Mark Scheme
+                            </a>
+                        )}
+                        <a className="rounded-full bg-amber-100 px-2 py-1" href={question.source_link}>Source 🔗 </a>
                       </div>
                     </div>
+                    {/*
                     <div className="flex items-center justify-start lg:justify-center">
                       <div className="rounded-2xl bg-amber-50 px-4 py-3 text-center">
                         <p className="text-lg font-semibold text-slate-900">
@@ -715,6 +736,7 @@ export default function App() {
                         </p>
                       </div>
                     </div>
+                    */}
                   </article>
                 ))}
                 {questions.length === 0 && (
@@ -731,7 +753,7 @@ export default function App() {
                       onClick={runAiPipeline}
                       disabled={isLoading}
                     >
-                      Run AI extraction
+                      Extract
                     </button>
                   </div>
                 )}
