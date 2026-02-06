@@ -4,6 +4,7 @@ import subprocess
 import os 
 import pymupdf
 import shutil 
+from pathlib import Path
 
 class HolyGrailScraper:
     def __init__(self, category, subject, year=None, documentType="Exam Papers", pages=1, headless=False):
@@ -104,9 +105,12 @@ class HolyGrailScraper:
     def download_documents(
         self,
         documents,
-        download_root='/home/ernie/grail_scraper/documents',
+        download_root=None,
         subject_label=None,
     ):
+        if not download_root:
+            project_root = Path(__file__).resolve().parents[1]
+            download_root = os.environ.get("DOCUMENTS_ROOT", str(project_root / "documents"))
         subject_name = subject_label if subject_label else self.subject
         safe_subject = "".join(
             ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in subject_name.strip()

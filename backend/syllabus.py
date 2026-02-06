@@ -95,8 +95,12 @@ def save_syllabus_text(text: str, output_path: Path) -> None:
 
 
 if __name__ == "__main__":
+    project_root = Path(__file__).resolve().parents[1]
+    syllabi_dir = Path(project_root / "syllabi")
+    sample_pdf = syllabi_dir / "9570_y26_sy.pdf"
+    output_path = syllabi_dir / "econs.txt"
+
     # Extract Syllabi
-    clean_text = extract_clean_body_text("/home/ernie/grail_scraper/syllabi/9570_y26_sy.pdf")
-    output_path = Path("/home/ernie/grail_scraper/syllabi/econs.txt")
+    clean_text = extract_clean_body_text(str(sample_pdf))
     save_syllabus_text(clean_text, output_path)
     print(clean_text)

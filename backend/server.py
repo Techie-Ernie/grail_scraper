@@ -5,17 +5,17 @@ import pymupdf
 from backend.scraper import HolyGrailScraper
 import glob 
 import asyncio
-from collections import Counter
 import re
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import and_, func, or_, select
 from db.engine import engine
-from db.models import Question, Subtopic
+from db.models import Collection, CollectionDocument, Question, Subtopic, UploadedQuestion
+from db.crud import create_schema
 from backend.syllabus import extract_clean_body_text, save_syllabus_text
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Literal
 from threading import Lock
-from fastapi import HTTPException
+import os
 
 app = FastAPI()
 
@@ -41,6 +41,7 @@ class QuestionContext(BaseModel):
     question_type: str
     source_link: str
     document_name: str
+    source_type: Literal["scraped", "uploaded"] = "scraped"
 
 class AIResultRequest(BaseModel):
     result: Dict[str, Any]
@@ -55,6 +56,16 @@ class SubtopicBulkCreate(BaseModel):
     subject: str
     subtopics: list[Dict[str, str]]
 
+class CollectionCreate(BaseModel):
+    name: str
+    subject: str
+
+class CollectionDocumentCreate(BaseModel):
+    collection_id: int
+    subject: str
+    source_type: Literal["scraped", "uploaded"]
+    document_name: str
+
 class ScraperConfig(BaseModel):
     category: str = "GCE 'A' Levels"
     subject: str = "H2 Economics"
@@ -67,6 +78,14 @@ _context_lock = Lock()
 _current_context: Optional[QuestionContext] = None
 _scraper_config_lock = Lock()
 _scraper_config = ScraperConfig()
+_document_cache_lock = Lock()
+_document_cache: dict[str, dict[str, Optional[str]]] = {}
+_document_cache_key: Optional[tuple] = None
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DOCUMENTS_ROOT = Path(os.environ.get("DOCUMENTS_ROOT", str(PROJECT_ROOT / "documents")))
+SYLLABI_DIR = Path(os.environ.get("SYLLABI_DIR", str(PROJECT_ROOT / "syllabi")))
+TMP_DIR = Path(os.environ.get("TMP_DIR", str(PROJECT_ROOT / "tmp")))
 
 SUBJECT_CODE_MAP = {
     "Economics (Syllabus 9750)": "H2 Economics",
@@ -79,6 +98,11 @@ SUBJECT_LABEL_CANONICAL = {
     "Economics (9750)": "Economics (Syllabus 9750)",
     "Economics (Syllabus 9750)": "Economics (Syllabus 9750)",
 }
+
+
+@app.on_event("startup")
+def initialize_schema() -> None:
+    create_schema()
 
 def normalize_subject_label(subject: str) -> str:
     cleaned = " ".join(subject.split())
@@ -122,12 +146,75 @@ def resolve_source_link(document_name: str, config: ScraperConfig) -> str:
             return doc.get("source_link") or ""
     return ""
 
-def normalize_year(year_value: Optional[str]) -> int:
+def _cache_key_for_config(config: ScraperConfig) -> tuple:
+    return (
+        normalize_category(config.category),
+        derive_scraper_subject(config.subject),
+        normalize_year(config.year),
+        config.document_type,
+        config.pages,
+    )
+
+def _update_document_cache(documents: list[dict], config: ScraperConfig) -> None:
+    cache_key = _cache_key_for_config(config)
+    mapping: dict[str, dict[str, Optional[str]]] = {}
+    for doc in documents or []:
+        name = (doc.get("document_name") or "").strip()
+        if not name:
+            continue
+        mapping[name] = {
+            "source_link": doc.get("source_link"),
+            "year": doc.get("year"),
+        }
+    with _document_cache_lock:
+        global _document_cache_key, _document_cache
+        _document_cache_key = cache_key
+        _document_cache = mapping
+
+def _get_document_cache(config: ScraperConfig) -> dict[str, dict[str, Optional[str]]]:
+    cache_key = _cache_key_for_config(config)
+    with _document_cache_lock:
+        if _document_cache_key == cache_key and _document_cache:
+            return dict(_document_cache)
+    return {}
+
+def _is_document_cache_current(config: ScraperConfig) -> bool:
+    cache_key = _cache_key_for_config(config)
+    with _document_cache_lock:
+        return _document_cache_key == cache_key and bool(_document_cache)
+
+def get_or_create_document_cache(config: ScraperConfig) -> dict[str, dict[str, Optional[str]]]:
+    cache = _get_document_cache(config)
+    if cache:
+        return cache
+    scraper_subject = derive_scraper_subject(config.subject)
+    scraper = HolyGrailScraper(
+        config.category,
+        scraper_subject,
+        config.year,
+        config.document_type,
+        pages=config.pages,
+    )
+    try:
+        asyncio.run(scraper.get_documents())
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(scraper.get_documents())
+        finally:
+            loop.close()
+    except Exception as exc:
+        print(f"Scraper error (cache build): {type(exc).__name__}: {exc}")
+        return {}
+    _update_document_cache(scraper.documents, config)
+    return _get_document_cache(config)
+
+def normalize_year(year_value: Optional[Any]) -> int:
     if year_value is None:
         return 0
     try:
         return int(year_value)
-    except ValueError:
+    except (TypeError, ValueError):
         return 0
 
 def safe_subject_name(subject: str) -> str:
@@ -141,23 +228,69 @@ def normalize_category(category: Optional[str]) -> Optional[str]:
         return "GCE 'A' Levels"
     return normalized
 
+
+def load_syllabus_text(subject: str) -> str:
+    preferred_path = SYLLABI_DIR / f"{safe_subject_name(subject)}.txt"
+    fallback_path = SYLLABI_DIR / "econs.txt"
+    if preferred_path.exists():
+        return preferred_path.read_text(encoding="utf-8")
+    if fallback_path.exists():
+        return fallback_path.read_text(encoding="utf-8")
+    return ""
+
+
+def extract_text_from_pdf_path(file_path: str) -> str:
+    model_prompt = ""
+    doc = pymupdf.open(file_path)
+    try:
+        for page in doc:
+            model_prompt += str(page.get_text()).replace("\n", " ")
+            model_prompt = re.sub(r"(\.\s*)\n\[(\d+)\]", r"\1 [\2]", model_prompt)
+    finally:
+        doc.close()
+    return model_prompt
+
+
+def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> str:
+    model_prompt = ""
+    doc = pymupdf.open(stream=pdf_bytes, filetype="pdf")
+    try:
+        for page in doc:
+            model_prompt += str(page.get_text()).replace("\n", " ")
+            model_prompt = re.sub(r"(\.\s*)\n\[(\d+)\]", r"\1 [\2]", model_prompt)
+    finally:
+        doc.close()
+    return model_prompt
+
+
+def build_prompt_payload(
+    model_prompt: str,
+    context: QuestionContext,
+    syllabus_text: str,
+) -> dict[str, Any]:
+    prompts_header = "Syllabus: " + syllabus_text + "Text: \n"
+    prompts = [prompts_header, model_prompt]
+    context_payload = context.model_dump() if hasattr(context, "model_dump") else context.dict()
+    return {"text": str(prompts), "context": context_payload}
+
 def find_question_papers(subject: str) -> list[str]:
     subject_dir = safe_subject_name(subject)
-    base_dir = f"/home/ernie/grail_scraper/documents/{subject_dir}"
-    files = glob.glob(f"{base_dir}/question_paper/*.pdf")
+    base_dir = DOCUMENTS_ROOT / subject_dir
+    files = glob.glob(str(base_dir / "question_paper" / "*.pdf"))
     if not files:
-        files = glob.glob(f"{base_dir}/question_papers/*.pdf")
+        files = glob.glob(str(base_dir / "question_papers" / "*.pdf"))
     if not files:
-        files = glob.glob("/home/ernie/grail_scraper/documents/*/question_paper/*.pdf")
+        files = glob.glob(str(DOCUMENTS_ROOT / "*" / "question_paper" / "*.pdf"))
     if not files:
-        files = glob.glob("/home/ernie/grail_scraper/documents/*/question_papers/*.pdf")
+        files = glob.glob(str(DOCUMENTS_ROOT / "*" / "question_papers" / "*.pdf"))
     return files
 
 def ensure_question_papers(config: ScraperConfig) -> list[str]:
     subject_label = normalize_subject_label(config.subject_label or config.subject)
     files = find_question_papers(subject_label)
     if files:
-        return files
+        if _is_document_cache_current(config):
+            return files
     scraper_subject = derive_scraper_subject(config.subject)
     scraper = HolyGrailScraper(
         config.category,
@@ -178,25 +311,26 @@ def ensure_question_papers(config: ScraperConfig) -> list[str]:
         print(f"Scraper error: {type(exc).__name__}: {exc}")
         return []
     if documents:
+        _update_document_cache(scraper.documents, config)
         scraper.download_documents(
             documents,
-            download_root="/home/ernie/grail_scraper/documents",
+            download_root=str(DOCUMENTS_ROOT),
             subject_label=subject_label,
         )
     return find_question_papers(subject_label)
 
-def insert_question(data: dict):
+def _upsert_question(model: type[Question] | type[UploadedQuestion], data: dict) -> None:
     if "subject" in data and data.get("subject"):
         data["subject"] = normalize_subject_label(data.get("subject"))
     if "category" in data:
         data["category"] = normalize_category(data.get("category"))
     with Session(engine) as session:
         existing = (
-            session.query(Question)
+            session.query(model)
             .filter(
-                Question.subject == data.get("subject"),
-                Question.year == data.get("year"),
-                Question.question_text == data.get("question_text"),
+                model.subject == data.get("subject"),
+                model.question_text == data.get("question_text"),
+                model.document_name == data.get("document_name"),
             )
             .first()
         )
@@ -209,9 +343,17 @@ def insert_question(data: dict):
             existing.source_link = data.get("source_link", existing.source_link)
             existing.answer_link = data.get("answer_link", existing.answer_link)
         else:
-            q = Question(**data)
+            q = model(**data)
             session.add(q)
         session.commit()
+
+
+def insert_question(data: dict) -> None:
+    _upsert_question(Question, data)
+
+
+def insert_uploaded_question(data: dict) -> None:
+    _upsert_question(UploadedQuestion, data)
 
 def list_subtopics(subject: Optional[str] = None):
     with Session(engine) as session:
@@ -255,6 +397,111 @@ def create_subtopics_bulk(payload: SubtopicBulkCreate):
         session.commit()
     return {"created": created}
 
+
+def list_collections(subject: Optional[str] = None):
+    normalized_subject = normalize_subject_label(subject) if subject else None
+    with Session(engine) as session:
+        query = session.query(Collection)
+        if normalized_subject:
+            query = query.filter(Collection.subject == normalized_subject)
+        query = query.order_by(Collection.name.asc())
+        rows = query.all()
+        collection_ids = [row.id for row in rows]
+        counts: dict[int, int] = {}
+        if collection_ids:
+            count_rows = (
+                session.query(CollectionDocument.collection_id, func.count(CollectionDocument.id))
+                .filter(CollectionDocument.collection_id.in_(collection_ids))
+                .group_by(CollectionDocument.collection_id)
+                .all()
+            )
+            counts = {row[0]: int(row[1]) for row in count_rows}
+        return [
+            {
+                "id": row.id,
+                "name": row.name,
+                "subject": row.subject,
+                "documents_count": counts.get(row.id, 0),
+            }
+            for row in rows
+        ]
+
+
+def create_collection(payload: CollectionCreate):
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Collection name is required.")
+    subject = normalize_subject_label(payload.subject.strip())
+    if not subject:
+        raise HTTPException(status_code=400, detail="Collection subject is required.")
+
+    with Session(engine) as session:
+        existing = (
+            session.query(Collection)
+            .filter(
+                func.lower(Collection.name) == name.lower(),
+                Collection.subject == subject,
+            )
+            .first()
+        )
+        if existing:
+            return {
+                "id": existing.id,
+                "name": existing.name,
+                "subject": existing.subject,
+                "documents_count": session.query(CollectionDocument).filter(
+                    CollectionDocument.collection_id == existing.id
+                ).count(),
+                "created": False,
+            }
+
+        row = Collection(name=name, subject=subject)
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        return {
+            "id": row.id,
+            "name": row.name,
+            "subject": row.subject,
+            "documents_count": 0,
+            "created": True,
+        }
+
+
+def add_document_to_collection(payload: CollectionDocumentCreate):
+    subject = normalize_subject_label(payload.subject.strip())
+    document_name = payload.document_name.strip()
+    if not document_name:
+        raise HTTPException(status_code=400, detail="document_name is required.")
+
+    with Session(engine) as session:
+        collection = session.query(Collection).filter(Collection.id == payload.collection_id).first()
+        if not collection:
+            raise HTTPException(status_code=404, detail="Collection not found.")
+
+        existing = (
+            session.query(CollectionDocument)
+            .filter(
+                CollectionDocument.collection_id == payload.collection_id,
+                CollectionDocument.subject == subject,
+                CollectionDocument.source_type == payload.source_type,
+                CollectionDocument.document_name == document_name,
+            )
+            .first()
+        )
+        if existing:
+            return {"added": False}
+
+        row = CollectionDocument(
+            collection_id=payload.collection_id,
+            subject=subject,
+            source_type=payload.source_type,
+            document_name=document_name,
+        )
+        session.add(row)
+        session.commit()
+        return {"added": True}
+
 def set_current_context(context: QuestionContext) -> None:
     global _current_context
     with _context_lock:
@@ -279,6 +526,8 @@ def refresh_context_from_scraper() -> QuestionContext:
         raise HTTPException(status_code=500, detail="Scraper context must be a dict.")
     if "question_type" not in raw_context:
         raw_context["question_type"] = "exam"
+    if "source_type" not in raw_context:
+        raw_context["source_type"] = "scraped"
     if raw_context.get("year") is None:
         raw_context["year"] = 0
     if not raw_context.get("document_name"):
@@ -302,31 +551,87 @@ def get_data():
     files = ensure_question_papers(config)
     if not files:
         raise HTTPException(status_code=404, detail="No question papers found for this subject.")
-    target_file = sorted(files)[0]
-    syllabus = "/home/ernie/grail_scraper/syllabi/econs.txt"
-    with open(syllabus, 'r') as f:
-        syllabus_text = f.read()
-    prompts = ["Syllabus: " + syllabus_text + "Text: \n"]
-    model_prompt = ""
-    doc = pymupdf.open(target_file)
-    for page in doc:
-        model_prompt += str(page.get_text()).replace('\n', ' ')
-        model_prompt = re.sub(r'(\.\s*)\n\[(\d+)\]', r'\1 [\2]', model_prompt) # pre-merge lines with the marks
-    print(model_prompt)
-    prompts.append(model_prompt)
-    document_name = Path(target_file).stem
-    source_link = resolve_source_link(document_name, config)
-    context = QuestionContext(
-        year=normalize_year(config.year),
-        subject=config.subject_label or config.subject,
-        category=config.category,
-        question_type="exam",
-        source_link=source_link,
-        document_name=document_name,
-    )
-    set_current_context(context)
-    context_payload = context.model_dump() if hasattr(context, "model_dump") else context.dict()
-    return {"text": str(prompts), "context": context_payload}
+    document_cache = get_or_create_document_cache(config)
+    syllabus_text = load_syllabus_text(config.subject_label or config.subject)
+
+    def build_document_payload(file_path: str) -> dict:
+        model_prompt = extract_text_from_pdf_path(file_path)
+        document_name = Path(file_path).stem
+        cached = document_cache.get(document_name, {})
+        source_link = cached.get("source_link") or ""
+        cached_year = cached.get("year")
+        if cached_year is not None:
+            try:
+                cached_year = int(cached_year)
+            except (TypeError, ValueError):
+                cached_year = None
+        context = QuestionContext(
+            year=cached_year if cached_year is not None else normalize_year(config.year),
+            subject=config.subject_label or config.subject,
+            category=config.category,
+            question_type="exam",
+            source_link=source_link,
+            document_name=document_name,
+            source_type="scraped",
+        )
+        return build_prompt_payload(model_prompt, context, syllabus_text)
+
+    documents_payload = [build_document_payload(path) for path in sorted(files)]
+    first_payload = documents_payload[0]
+    set_current_context(QuestionContext(**first_payload["context"]))
+    return {
+        "text": first_payload["text"],
+        "context": first_payload["context"],
+        "documents": documents_payload,
+    }
+
+
+@app.post("/uploads/question-documents/extract")
+async def extract_uploaded_question_documents(
+    subject: str = Form(...),
+    category: str = Form("GCE 'A' Levels"),
+    files: list[UploadFile] = File(...),
+):
+    if not files:
+        raise HTTPException(status_code=400, detail="At least one PDF file is required.")
+
+    normalized_subject = normalize_subject_label(subject)
+    normalized_category = normalize_category(category) or "GCE 'A' Levels"
+    syllabus_text = load_syllabus_text(normalized_subject)
+    documents_payload = []
+
+    for file in files:
+        filename = file.filename or ""
+        if not filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail=f"Only PDF files are supported: {filename}")
+
+        file_bytes = await file.read()
+        if not file_bytes:
+            continue
+
+        model_prompt = extract_text_from_pdf_bytes(file_bytes)
+        document_name = Path(filename).stem or "uploaded_document"
+        context = QuestionContext(
+            year=0,
+            subject=normalized_subject,
+            category=normalized_category,
+            question_type="exam",
+            source_link="",
+            document_name=document_name,
+            source_type="uploaded",
+        )
+        documents_payload.append(build_prompt_payload(model_prompt, context, syllabus_text))
+
+    if not documents_payload:
+        raise HTTPException(status_code=400, detail="No readable PDF files were uploaded.")
+
+    first_payload = documents_payload[0]
+    set_current_context(QuestionContext(**first_payload["context"]))
+    return {
+        "text": first_payload["text"],
+        "context": first_payload["context"],
+        "documents": documents_payload,
+    }
 
 @app.post("/data")
 def receive_data(data: ScrapedData):
@@ -387,12 +692,31 @@ def get_subjects():
     subjects = sorted({normalize_subject_label(row[0]) for row in rows if row[0]})
     return {"subjects": subjects}
 
+
+@app.get("/collections")
+def get_collections(subject: Optional[str] = None):
+    normalized_subject = normalize_subject_label(subject) if subject and subject.lower() not in {"all", "any"} else None
+    return {"collections": list_collections(normalized_subject)}
+
+
+@app.post("/collections")
+def add_collection(payload: CollectionCreate):
+    return {"collection": create_collection(payload)}
+
+
+@app.post("/collections/documents")
+def add_collection_document(payload: CollectionDocumentCreate):
+    return add_document_to_collection(payload)
+
 @app.get("/questions")
 def get_questions(
     subject: Optional[str] = None,
-    year: Optional[str] = None,
     category: Optional[str] = None,
+    question_type: Optional[str] = None,
     subtopic: Optional[str] = None,
+    subtopics: Optional[str] = None,
+    collections: Optional[str] = None,
+    source_type: Optional[str] = None,
 ):
     def normalize_filter(value: Optional[str]) -> Optional[str]:
         if value is None:
@@ -404,33 +728,118 @@ def get_questions(
 
     subject = normalize_filter(subject)
     category = normalize_category(normalize_filter(category))
+    question_type = normalize_filter(question_type)
     subtopic = normalize_filter(subtopic)
+    subtopics = normalize_filter(subtopics)
+    collections = normalize_filter(collections)
+    source_type = normalize_filter(source_type)
+    if source_type:
+        source_type = source_type.lower()
+        if source_type not in {"scraped", "uploaded"}:
+            raise HTTPException(status_code=400, detail="source_type must be 'scraped' or 'uploaded'.")
+    subtopic_codes: list[str] = []
+    if subtopics:
+        subtopic_codes = [code.strip() for code in subtopics.split(",") if code.strip()]
+    if subtopic and subtopic not in subtopic_codes:
+        subtopic_codes.append(subtopic)
+    collection_ids: list[int] = []
+    if collections:
+        for raw_id in collections.split(","):
+            raw_id = raw_id.strip()
+            if not raw_id:
+                continue
+            try:
+                parsed = int(raw_id)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail="Invalid collection id.") from exc
+            if parsed > 0 and parsed not in collection_ids:
+                collection_ids.append(parsed)
     if subject:
         subject = normalize_subject_label(subject)
-    year_value: Optional[int] = None
-    if year is not None:
-        year = year.strip()
-        if year and year.lower() not in {"all", "any"}:
-            try:
-                year_value = int(year)
-            except ValueError:
-                year_value = None
 
-    with Session(engine) as session:
-        query = session.query(Question)
+    def query_question_rows(
+        session: Session,
+        model: type[Question] | type[UploadedQuestion],
+        source_tag: str,
+    ) -> list[dict[str, Any]]:
+        query = session.query(model)
         if subject:
-            query = query.filter(Question.subject == subject)
-        if year_value is not None:
-            query = query.filter(Question.year == year_value)
+            query = query.filter(model.subject == subject)
+        if collection_ids:
+            pairs_query = (
+                session.query(CollectionDocument.subject, CollectionDocument.document_name)
+                .filter(
+                    CollectionDocument.collection_id.in_(collection_ids),
+                    CollectionDocument.source_type == source_tag,
+                )
+                .distinct()
+            )
+            if subject:
+                pairs_query = pairs_query.filter(CollectionDocument.subject == subject)
+            subject_doc_pairs = [
+                (row[0], row[1])
+                for row in pairs_query.all()
+                if row[0] and row[1]
+            ]
+            if not subject_doc_pairs:
+                return []
+            query = query.filter(
+                or_(
+                    *[
+                        and_(model.subject == pair_subject, model.document_name == pair_doc)
+                        for pair_subject, pair_doc in subject_doc_pairs
+                    ]
+                )
+            )
         if category:
-            query = query.filter(Question.category == category)
-        if subtopic:
-            query = query.filter(Question.chapter.like(f"{subtopic} %"))
-        query = query.order_by(Question.year.desc(), Question.id.desc()).limit(200)
-        results = [
+            query = query.filter(model.category == category)
+        if question_type:
+            query = query.filter(model.question_type == question_type)
+        if subtopic_codes:
+            chapter_filters = []
+            for code in subtopic_codes:
+                chapter_filters.append(model.chapter.like(f"{code} %"))
+                chapter_filters.append(model.chapter.like(f"{code}.%"))
+            query = query.filter(or_(*chapter_filters))
+        query = query.order_by(model.id.desc()).limit(200)
+        rows = query.all()
+
+        collection_names_by_doc: dict[tuple[str, str], list[str]] = {}
+        document_pairs = {
+            (q.subject, q.document_name)
+            for q in rows
+            if q.subject and q.document_name
+        }
+        if document_pairs:
+            pair_filters = [
+                and_(
+                    CollectionDocument.subject == pair_subject,
+                    CollectionDocument.document_name == pair_document,
+                )
+                for pair_subject, pair_document in document_pairs
+            ]
+            collection_rows = (
+                session.query(
+                    CollectionDocument.subject,
+                    CollectionDocument.document_name,
+                    Collection.name,
+                )
+                .join(Collection, Collection.id == CollectionDocument.collection_id)
+                .filter(
+                    CollectionDocument.source_type == source_tag,
+                    or_(*pair_filters),
+                )
+                .all()
+            )
+            for pair_subject, pair_document, collection_name in collection_rows:
+                key = (pair_subject, pair_document)
+                collection_names_by_doc.setdefault(key, [])
+                if collection_name and collection_name not in collection_names_by_doc[key]:
+                    collection_names_by_doc[key].append(collection_name)
+
+        return [
             {
                 "id": q.id,
-                "year": q.year,
                 "subject": q.subject,
                 "category": q.category,
                 "question_type": q.question_type,
@@ -438,25 +847,61 @@ def get_questions(
                 "question_text": q.question_text,
                 "marks": q.marks,
                 "source_link": q.source_link,
-                "document_name": q.document_name
+                "document_name": q.document_name,
+                "source_type": source_tag,
+                "collections": sorted(
+                    collection_names_by_doc.get((q.subject, q.document_name), []),
+                    key=str.lower,
+                ),
             }
-            for q in query.all()
+            for q in rows
         ]
-    return {"questions": results}
+
+    with Session(engine) as session:
+        scraped_results = (
+            query_question_rows(session, Question, "scraped")
+            if source_type in {None, "scraped"}
+            else []
+        )
+        uploaded_results = (
+            query_question_rows(session, UploadedQuestion, "uploaded")
+            if source_type in {None, "uploaded"}
+            else []
+        )
+
+    combined = sorted(
+        [*scraped_results, *uploaded_results],
+        key=lambda row: row.get("id", 0),
+        reverse=True,
+    )
+    return {
+        "questions": combined,
+        "scraped_questions": scraped_results,
+        "uploaded_questions": uploaded_results,
+    }
 
 @app.get("/questions/filters")
 def get_question_filters():
     with Session(engine) as session:
-        subjects = sorted({
-            row[0] for row in session.execute(select(Question.subject).distinct()).all() if row[0]
-        })
-        categories = sorted({
+        scraped_subjects = {row[0] for row in session.execute(select(Question.subject).distinct()).all() if row[0]}
+        uploaded_subjects = {
+            row[0] for row in session.execute(select(UploadedQuestion.subject).distinct()).all() if row[0]
+        }
+        scraped_categories = {
             row[0] for row in session.execute(select(Question.category).distinct()).all() if row[0]
-        })
-        years = sorted({
-            row[0] for row in session.execute(select(Question.year).distinct()).all() if row[0]
-        }, reverse=True)
-    return {"subjects": subjects, "categories": categories, "years": years}
+        }
+        uploaded_categories = {
+            row[0] for row in session.execute(select(UploadedQuestion.category).distinct()).all() if row[0]
+        }
+        source_counts = {
+            "scraped": session.query(Question).count(),
+            "uploaded": session.query(UploadedQuestion).count(),
+        }
+    return {
+        "subjects": sorted(scraped_subjects | uploaded_subjects),
+        "categories": sorted(scraped_categories | uploaded_categories),
+        "source_counts": source_counts,
+    }
 
 @app.post("/syllabus/extract")
 async def extract_syllabus(
@@ -467,15 +912,14 @@ async def extract_syllabus(
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     data = await file.read()
-    temp_dir = Path("/home/ernie/grail_scraper/tmp")
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = temp_dir / file.filename
+    TMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_path = TMP_DIR / file.filename
     temp_path.write_bytes(data)
 
     text = extract_clean_body_text(str(temp_path))
 
     safe_name = "".join(ch if ch.isalnum() or ch in ("_", "-") else "_" for ch in subject.strip())
-    output_path = Path(f"/home/ernie/grail_scraper/syllabi/{safe_name}.txt")
+    output_path = SYLLABI_DIR / f"{safe_name}.txt"
     save_syllabus_text(text, output_path)
 
     return {"subject": subject, "text": text, "path": str(output_path)}
@@ -488,6 +932,10 @@ def receive_ai_result(payload: AIResultRequest):
             context = refresh_context_from_scraper()
         if not context or not context.document_name:
             raise HTTPException(status_code=400, detail="Missing QuestionContext")
+        target_source = (context.source_type or "scraped").lower()
+        if target_source not in {"scraped", "uploaded"}:
+            raise HTTPException(status_code=400, detail="Invalid context.source_type")
+        insert_fn = insert_question if target_source == "scraped" else insert_uploaded_question
         data = payload.result
         # parse the exam-style questions 
         print("AI payload keys:", list(data.keys()) if isinstance(data, dict) else type(data))
@@ -495,7 +943,6 @@ def receive_ai_result(payload: AIResultRequest):
         for row in data.get("exam", []):
             print("Exam row:", row)
             data_json = {
-                "year": context.year,
                 "subject": context.subject,
                 "category": context.category,
                 "question_type": "exam",
@@ -505,11 +952,10 @@ def receive_ai_result(payload: AIResultRequest):
                 "question_text": row["question"],
                 "marks": row["marks"],
             }
-            insert_question(data_json)
+            insert_fn(data_json)
         for row in data.get("understanding", []):
             print("Understanding row:", row)
             data_json = {
-                "year": context.year,
                 "subject": context.subject,
                 "category": context.category,
                 "question_type": "understanding",
@@ -519,8 +965,8 @@ def receive_ai_result(payload: AIResultRequest):
                 "question_text": row["question"],
                 "marks": None,
             }
-            insert_question(data_json)
-        return {"status": "received"}
+            insert_fn(data_json)
+        return {"status": "received", "source_type": target_source}
     except HTTPException:
         raise
     except Exception as exc:
