@@ -18,6 +18,14 @@ class HolyGrailScraper:
         self.current_document_name = None
         self.current_source_link = None
 
+    def _validate_subject_selected(self) -> None:
+        # Backend guard: scraping with an empty/"All" subject can accidentally scrape broad results.
+        if self.subject is None:
+            raise ValueError("subject is required to scrape documents.")
+        cleaned = str(self.subject).strip()
+        if not cleaned or cleaned.lower() in {"all", "any", "none", "select"}:
+            raise ValueError("subject must be selected before scraping documents.")
+
     def set_current_document(self, source_link, document_name):
         self.current_source_link = source_link
         self.current_document_name = document_name
@@ -38,6 +46,7 @@ class HolyGrailScraper:
         else:
             asyncio.run(self.get_documents())
     async def get_documents(self):
+        self._validate_subject_selected()
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=self.headless)
             page = await browser.new_page()
@@ -131,7 +140,7 @@ class HolyGrailScraper:
                     check=False
                 )
                 pdf = pymupdf.open(f"{download_dir}/{document_name}")
-                ans = ['markscheme', 'answerkey', 'answersheet', "suggestedanswers", "examinersreportf"]
+                ans = ['markscheme', 'answerkey', 'answersheet', "suggestedanswers", "examinersreport", "examiners'report", "ans", "ms", "markscheme"]
                 if any(word in pdf[0].get_text().strip().replace(' ', '').lower() for word in ans) or any(word in document_name.strip().replace(' ', '').lower() for word in ans):
                     # check if file is answer key using the file name or first page of pdf 
                     # maybe can remove first page check? but it barely adds any latency

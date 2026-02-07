@@ -182,6 +182,8 @@ export default function App() {
   const [category, setCategory] = useState("All");
   const [document_name, setDocumentName] = useState("Document Name");
   const [questionType, setQuestionType] = useState(questionTypeOptions[0]);
+  const [questionSearch, setQuestionSearch] = useState("");
+  const [debouncedQuestionSearch, setDebouncedQuestionSearch] = useState("");
   const [scraperPages, setScraperPages] = useState(DEFAULT_SCRAPER_PAGES);
   const [syllabusFile, setSyllabusFile] = useState(null);
   const [questionUploadFiles, setQuestionUploadFiles] = useState([]);
@@ -313,6 +315,13 @@ export default function App() {
   }, [subject]);
 
   useEffect(() => {
+    const handle = window.setTimeout(() => {
+      setDebouncedQuestionSearch(questionSearch.trim());
+    }, 250);
+    return () => window.clearTimeout(handle);
+  }, [questionSearch]);
+
+  useEffect(() => {
     if (subject === "All") {
       setScrapedQuestions([]);
       setUploadedQuestions([]);
@@ -320,7 +329,14 @@ export default function App() {
       return;
     }
     loadQuestions();
-  }, [subject, category, questionType, selectedSubtopicCodes.join("|"), selectedCollectionIds.join("|")]);
+  }, [
+    subject,
+    category,
+    questionType,
+    debouncedQuestionSearch,
+    selectedSubtopicCodes.join("|"),
+    selectedCollectionIds.join("|"),
+  ]);
 
   useEffect(() => {
     setResultsPage(1);
@@ -500,6 +516,7 @@ export default function App() {
         subject,
         category,
         question_type: questionType,
+        search: debouncedQuestionSearch,
         subtopics: selectedSubtopicCodes.join(","),
         collections: selectedCollectionIds.join(","),
       };
@@ -669,6 +686,10 @@ export default function App() {
   const runScrapedAiPipeline = async () => {
     if (!window.puter?.ai?.chat) {
       setStatus({ type: "error", message: "Puter.js is not available." });
+      return;
+    }
+    if (!subject || subject === "All") {
+      setStatus({ type: "error", message: "Select a subject before scraping documents." });
       return;
     }
 
@@ -1130,7 +1151,7 @@ export default function App() {
               )}
             </section>
 
-            <section className="grid gap-4 rounded-2xl border border-slate-200 bg-white/80 p-6 shadow-sm md:grid-cols-3">
+            <section className="grid gap-4 rounded-2xl border border-slate-200 bg-white/80 p-6 shadow-sm md:grid-cols-4">
               <div className="space-y-2 text-sm">
                 <label htmlFor="category" className="font-semibold text-slate-800">
                   Category
@@ -1169,6 +1190,33 @@ export default function App() {
               </div>
 
               <div className="space-y-2 text-sm">
+                <label htmlFor="questionSearch" className="font-semibold text-slate-800">
+                  Search questions
+                </label>
+                <div className="flex gap-2">
+                  <input
+                    id="questionSearch"
+                    value={questionSearch}
+                    onChange={(event) => setQuestionSearch(event.target.value)}
+                    placeholder="e.g. price controls, inflation"
+                    className="min-w-0 flex-1 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 shadow-sm focus:border-slate-400 focus:outline-none focus:ring-2 focus:ring-amber-200"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setQuestionSearch("")}
+                    disabled={!questionSearch}
+                    className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-xs font-semibold text-slate-600 shadow-sm hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                    title="Clear search"
+                  >
+                    Clear
+                  </button>
+                </div>
+                <p className="text-xs text-slate-500">
+                  Filters by question text (space-separated terms).
+                </p>
+              </div>
+
+              <div className="space-y-2 text-sm">
                 <label htmlFor="scraperPages" className="font-semibold text-slate-800">
                   Scraper pages
                 </label>
@@ -1193,7 +1241,8 @@ export default function App() {
                 type="button"
                 className={accentButton}
                 onClick={runScrapedAiPipeline}
-                disabled={isLoading}
+                disabled={isLoading || subject === "All"}
+                title={subject === "All" ? "Select a subject first" : "Scrape documents for the selected subject"}
               >
                 Scrape Documents
               </button>

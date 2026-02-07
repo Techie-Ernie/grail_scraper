@@ -342,6 +342,11 @@ def ensure_question_papers(config: ScraperConfig) -> list[str]:
 
 
 def download_question_papers_for_run(config: ScraperConfig) -> tuple[list[str], Path]:
+    # Reject scraping without an explicit subject selection.
+    selected_subject = (config.subject_label or config.subject or "").strip()
+    if not selected_subject or selected_subject.lower() in {"all", "any"}:
+        raise HTTPException(status_code=400, detail="Select a subject before scraping documents.")
+
     subject_label = normalize_subject_label(config.subject_label or config.subject)
     scraper_subject = derive_scraper_subject(config.subject)
     scraper = HolyGrailScraper(
@@ -798,6 +803,7 @@ def get_questions(
     subject: Optional[str] = None,
     category: Optional[str] = None,
     question_type: Optional[str] = None,
+    search: Optional[str] = None,
     subtopic: Optional[str] = None,
     subtopics: Optional[str] = None,
     collections: Optional[str] = None,
@@ -816,6 +822,7 @@ def get_questions(
     subject = normalize_filter(subject)
     category = normalize_category(normalize_filter(category))
     question_type = normalize_filter(question_type)
+    search = normalize_filter(search)
     subtopic = normalize_filter(subtopic)
     subtopics = normalize_filter(subtopics)
     collections = normalize_filter(collections)
@@ -843,6 +850,14 @@ def get_questions(
                 collection_ids.append(parsed)
     if subject:
         subject = normalize_subject_label(subject)
+
+    def escape_like(value: str) -> str:
+        # Escape SQL LIKE wildcards so user input is treated literally.
+        return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+    search_terms: list[str] = []
+    if search:
+        search_terms = [term for term in re.split(r"\s+", search.strip()) if term]
 
     def query_question_rows(
         session: Session,
@@ -886,6 +901,11 @@ def get_questions(
             query = query.filter(model.category == category)
         if question_type:
             query = query.filter(model.question_type == question_type)
+        if search_terms:
+            # AND semantics across terms; avoids unexpected broad matches.
+            for term in search_terms[:8]:
+                pattern = f"%{escape_like(term)}%"
+                query = query.filter(model.question_text.ilike(pattern, escape="\\"))
         if subtopic_codes:
             chapter_filters = []
             for code in subtopic_codes:
