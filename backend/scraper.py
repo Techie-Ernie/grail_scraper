@@ -6,6 +6,8 @@ import pymupdf
 import shutil 
 from pathlib import Path
 import re
+import time
+import requests
 
 class HolyGrailScraper:
     def __init__(self, category, subject, year=None, documentType="Exam Papers", pages=1, headless=True):
@@ -145,19 +147,80 @@ class HolyGrailScraper:
                 return False
             return any(pattern.search(text) for pattern in answer_key_patterns)
 
+        def is_probably_pdf(path: str) -> bool:
+            try:
+                if not os.path.exists(path):
+                    return False
+                if os.path.getsize(path) < 8:
+                    return False
+                with open(path, "rb") as f:
+                    return f.read(4) == b"%PDF"
+            except Exception:
+                return False
+
+        def safe_unlink(path: str) -> None:
+            try:
+                if path and os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+        def download_pdf(url: str, dest_path: str, retries: int = 3) -> bool:
+            # Use requests instead of relying on wget, and validate we got a real PDF.
+            tmp_path = f"{dest_path}.part"
+            last_error: Exception | None = None
+            headers = {"User-Agent": "graili-scraper/1.0"}
+
+            for attempt in range(1, retries + 1):
+                safe_unlink(tmp_path)
+                safe_unlink(dest_path)
+                try:
+                    with requests.get(url, stream=True, timeout=(15, 90), headers=headers) as res:
+                        if res.status_code != 200:
+                            raise RuntimeError(f"HTTP {res.status_code}")
+                        with open(tmp_path, "wb") as f:
+                            for chunk in res.iter_content(chunk_size=128 * 1024):
+                                if chunk:
+                                    f.write(chunk)
+                    os.replace(tmp_path, dest_path)
+                    if not is_probably_pdf(dest_path):
+                        raise RuntimeError("Downloaded content is not a PDF (bad magic/empty).")
+                    return True
+                except Exception as exc:
+                    last_error = exc
+                    safe_unlink(tmp_path)
+                    safe_unlink(dest_path)
+                    if attempt < retries:
+                        time.sleep(0.6 * attempt)
+
+            print(f"Download failed after {retries} attempts: {url} -> {dest_path}: {last_error}")
+            return False
+
         for link, document_name in documents.items():
             self.set_current_document(link, document_name)
             document_name = document_name + ".pdf"
             if not os.path.exists(f"{ans_dir}/{document_name}") and not os.path.exists(f"{question_dir}/{document_name}"):
-                subprocess.run(
-                    ["wget", link, "-O", document_name],
-                    cwd=download_dir,
-                    check=False
-                )
                 file_path = f"{download_dir}/{document_name}"
+                ok = False
+                try:
+                    ok = download_pdf(link, file_path, retries=3)
+                except Exception as exc:
+                    print(f"Download error: {type(exc).__name__}: {exc} ({link})")
+                    ok = False
+
+                if not ok:
+                    # Skip this document rather than failing the whole scrape run.
+                    continue
+
+                first_page_text = ""
                 try:
                     pdf = pymupdf.open(file_path)
                     first_page_text = pdf[0].get_text() if pdf.page_count else ""
+                except Exception as exc:
+                    # If PyMuPDF can't open it, treat it as a bad download and skip.
+                    print(f"PDF open failed, skipping: {type(exc).__name__}: {exc} ({file_path})")
+                    safe_unlink(file_path)
+                    continue
                 finally:
                     try:
                         pdf.close()
